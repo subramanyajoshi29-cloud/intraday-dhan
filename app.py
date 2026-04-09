@@ -75,6 +75,15 @@ def save_creds_to_cache(token, client_id):
 
 # Input for Access Token and Client ID (Frontend Only)
 cached_token, cached_client_id = load_cached_creds()
+
+# Add a button to clear cache
+if st.sidebar.button("🗑️ Clear Saved Credentials"):
+    if os.path.exists(TOKEN_FILE):
+        os.remove(TOKEN_FILE)
+    st.cache_data.clear()
+    st.session_state["first_run"] = True
+    st.rerun()
+
 client_id = st.sidebar.text_input("Enter Client ID", value=cached_client_id if cached_client_id else "")
 access_token = st.sidebar.text_input("Enter Access Token", type="password", value=cached_token if cached_token else "")
 
@@ -91,23 +100,37 @@ else:
 
 # --- Auto-Refresh Controls ---
 st.sidebar.markdown("---")
-st.sidebar.header("Auto-Refresh Settings")
+st.sidebar.header("Settings")
 atm_mode = st.sidebar.radio("ATM Strike Based On:", ("Fixed (Open Price)", "Dynamic (LTP)"), index=0)
 auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
 refresh_interval = st.sidebar.number_input("Refresh Interval (seconds)", min_value=5, value=30, step=5)
+debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
 
 # --- Instruments Data Synchronization ---
 INSTRUMENTS_FILE = 'api-scrip-master.csv'
+INSTRUMENTS_FILE_GZ = 'api-scrip-master.csv.gz'
 CACHE_FILE = 'instruments_cache.pkl'
 
+def get_active_instruments_file():
+    """Returns the path of the available instruments file (CSV or GZ)."""
+    if os.path.exists(INSTRUMENTS_FILE):
+        return INSTRUMENTS_FILE
+    elif os.path.exists(INSTRUMENTS_FILE_GZ):
+        return INSTRUMENTS_FILE_GZ
+    return None
+
 def get_file_date(filepath):
-    if not os.path.exists(filepath):
+    if not filepath or not os.path.exists(filepath):
         return None
     return datetime.datetime.fromtimestamp(os.path.getmtime(filepath)).date()
 
-def is_file_fresh(filepath):
-    """Check if file exists and is from today"""
-    f_date = get_file_date(filepath)
+def is_file_fresh():
+    """Check if we have a valid file from today"""
+    active_file = get_active_instruments_file()
+    if not active_file:
+        return False
+    
+    f_date = get_file_date(active_file)
     if f_date:
         return f_date == datetime.date.today()
     return False
@@ -128,10 +151,7 @@ def download_scrip_master():
     except Exception as e:
         return False, str(e)
 
-file_date = get_file_date(INSTRUMENTS_FILE)
-is_fresh = False
-if file_date:
-    is_fresh = (file_date == datetime.date.today())
+is_fresh = is_file_fresh()
 
 # Auto-download if missing or not fresh
 if not is_fresh:
@@ -148,15 +168,22 @@ if not is_fresh:
         status_placeholder.success(f"✅ Updated Scrip Master ({get_today_str()})")
         is_fresh = True
     else:
-        status_placeholder.error(f"❌ Auto-download failed: {msg}")
+        # If download failed but we have a GZ file (even if old), use it as fallback
+        if get_active_instruments_file():
+             status_placeholder.warning(f"⚠️ Auto-download failed: {msg}. Using existing data.")
+             is_fresh = True
+        else:
+             status_placeholder.error(f"❌ Auto-download failed: {msg}")
 
-# Display status if fresh (or became fresh)
-if is_fresh:
-    st.sidebar.success(f"✅ Scrip Master: Up to date")
-    st.sidebar.caption(f"Date: {get_today_str()}")
+# Display status
+active_file = get_active_instruments_file()
+if is_fresh and active_file:
+    f_date = get_file_date(active_file)
+    st.sidebar.success(f"✅ Scrip Master: Ready")
+    st.sidebar.caption(f"Date: {f_date} (Source: {active_file})")
 else:
     # Fallback UI if download failed
-    if st.sidebar.button("� Retry Download"):
+    if st.sidebar.button("🔄 Retry Download"):
         with st.sidebar.status("Retrying..."):
             success, msg = download_scrip_master()
             if success:
@@ -193,17 +220,18 @@ def load_data():
     df = None
     
     # 1. Try to load from fast pickle cache first
-    if is_file_fresh(CACHE_FILE):
+    if os.path.exists(CACHE_FILE):
         try:
             df = pd.read_pickle(CACHE_FILE)
-            # print("DEBUG: Loaded from Pickle Cache")
         except Exception:
             df = None
 
-    # 2. If no cache, load from CSV
+    # 2. If no cache, load from CSV/GZ
     if df is None:
-        if not os.path.exists(INSTRUMENTS_FILE):
-            st.error(f"Instruments file not found: {INSTRUMENTS_FILE}")
+        file_to_read = get_active_instruments_file()
+        
+        if not file_to_read:
+            st.error(f"Instruments file not found. Please download or upload 'api-scrip-master.csv'.")
             return pd.DataFrame(), pd.DataFrame()
 
         # Load and Filter CSV directly
@@ -223,16 +251,20 @@ def load_data():
             chunk_list = []
             chunk_size = 50000
             
+            # Check compression
+            compression = 'gzip' if file_to_read.endswith('.gz') else None
+            
             # Read in chunks to filter efficiently
-            for chunk in pd.read_csv(INSTRUMENTS_FILE, usecols=usecols, chunksize=chunk_size):
-                # Filter for NSE Derivatives (NSE FO)
-                # SEM_EXM_EXCH_ID == 'NSE' and SEM_SEGMENT == 'D'
-                filtered = chunk[
-                    (chunk['SEM_EXM_EXCH_ID'] == 'NSE') & 
-                    (chunk['SEM_SEGMENT'] == 'D')
-                ]
-                if not filtered.empty:
-                    chunk_list.append(filtered)
+            with pd.read_csv(file_to_read, usecols=usecols, chunksize=chunk_size, low_memory=False, compression=compression) as reader:
+                for chunk in reader:
+                    # Filter for NSE Derivatives (NSE FO)
+                    # SEM_EXM_EXCH_ID == 'NSE' and SEM_SEGMENT == 'D'
+                    filtered = chunk[
+                        (chunk['SEM_EXM_EXCH_ID'] == 'NSE') & 
+                        (chunk['SEM_SEGMENT'] == 'D')
+                    ]
+                    if not filtered.empty:
+                        chunk_list.append(filtered)
             
             if not chunk_list:
                 return pd.DataFrame(), pd.DataFrame()
@@ -321,7 +353,8 @@ with st.spinner("Initializing Application and Loading Data..."):
     futures_df, options_df = load_data()
 
 if futures_df.empty or options_df.empty:
-    st.error("Failed to load instruments data. Please check your internet connection and restart.")
+    st.error(f"Failed to load instruments data. Futures: {len(futures_df)}, Options: {len(options_df)}")
+    st.info("Please check your internet connection and restart. Ensure api-scrip-master.csv is valid.")
     st.stop()
 
 # --- API Functions ---
@@ -350,6 +383,14 @@ def get_ohlc(instrument_keys, token, client_id):
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=10)
             
+            if response.status_code == 401:
+                st.error("🔑 401 Unauthorized: Your Dhan Access Token or Client ID is incorrect or expired. Please check your credentials in the sidebar.")
+                return {}
+                
+            if response.status_code == 401:
+                st.error("🔑 401 Unauthorized: Your Dhan Access Token or Client ID is incorrect or expired. Please check your credentials in the sidebar.")
+                return {}
+                
             if response.status_code == 429:
                 # Rate limit exceeded, wait and retry
                 time.sleep(1 + attempt)
@@ -358,19 +399,18 @@ def get_ohlc(instrument_keys, token, client_id):
             response.raise_for_status()
             data = response.json()
             if data.get('status') == 'success':
-                # Return the nested dictionary for NSE_FNO
-                # Format: {'49081': {'last_price': ..., 'ohlc': {...}}}
-                return data.get('data', {}).get('NSE_FNO', {})
+                # Return the nested dictionary for NSE_FNO or the data dict directly
+                resp_data = data.get('data', {})
+                if 'NSE_FNO' in resp_data:
+                    return resp_data.get('NSE_FNO', {})
+                return resp_data
             else:
                 break # Non-retriable error
                 
         except Exception as e:
-            # st.error(f"Error fetching OHLC: {e}") 
-            pass
-        
-        # If we got here (exception or non-200 that isn't 429), break or retry?
-        # Usually exception means network error, so maybe retry
-        time.sleep(0.5)
+            if attempt == max_retries - 1:
+                st.error(f"Error fetching OHLC: {e}")
+            time.sleep(0.5)
         
     return {}
 
@@ -424,8 +464,10 @@ def get_ltp(instrument_keys, token, client_id):
 
             if data.get('status') == 'success':
                  # Format: {'49081': {'last_price': ..., 'volume': ...}}
-                result = data.get('data', {}).get('NSE_FNO', {})
-                return result
+                resp_data = data.get('data', {})
+                if 'NSE_FNO' in resp_data:
+                    return resp_data.get('NSE_FNO', {})
+                return resp_data
             else:
                  # API returned error status
                  if attempt == max_retries - 1:
@@ -448,8 +490,16 @@ def get_ltp(instrument_keys, token, client_id):
 run_once = False
 if not client_view:
     run_once = st.button("🔄 Refresh Data", type="primary")
-    
-should_run = run_once or auto_refresh
+
+# Initialize first run state
+if "first_run" not in st.session_state:
+    st.session_state["first_run"] = True
+
+should_run = run_once or auto_refresh or st.session_state["first_run"]
+
+# After checking should_run, we can reset first_run so it doesn't trigger every time
+if should_run:
+    st.session_state["first_run"] = False
 
 # Define column name globally based on selection
 price_key = 'open' if atm_mode == "Fixed (Open Price)" else 'close'
@@ -487,7 +537,7 @@ if should_run:
         all_results = []
         
         # Batch processing for Futures OHLC
-        chunk_size = 1000 # Dhan API supports up to 1000 keys
+        chunk_size = 100  # Dhan API limit is 100 keys per request
         future_records = unique_futures.to_dict('records')
         total_records = len(future_records)
         
@@ -508,6 +558,9 @@ if should_run:
         # Prepare chunks
         chunks = [future_records[i:i+chunk_size] for i in range(0, total_records, chunk_size)]
         total_chunks = len(chunks)
+        
+        if total_records == 0:
+             print("No records found for futures fetch.")
         
         # Function to process a single chunk of futures
         def fetch_futures_chunk(chunk):
@@ -629,7 +682,7 @@ if should_run:
             all_results = []
             
             # Batch processing for Futures OHLC
-            chunk_size = 1000  # Dhan API supports up to 1000 keys per request
+            chunk_size = 100  # Dhan API limit is 100 keys per request
             future_records = unique_futures.to_dict('records')
             total_records = len(future_records)
             
@@ -663,6 +716,9 @@ if should_run:
             if status_text:
                 status_text.text(f"Fetching Futures Data... (0/{total_records})")
             
+            if total_records == 0:
+                st.warning("No unique futures found to fetch data for.")
+            
             # SEQUENTIAL FETCH to respect Rate Limits
             completed_count = 0
             for chunk in chunks:
@@ -680,6 +736,11 @@ if should_run:
                 if status_text:
                     status_text.text(f"Fetching Futures Data... ({min(completed_count * chunk_size, total_records)}/{total_records})")
                 time.sleep(0.1) # Small delay between chunks
+
+            if debug_mode:
+                st.write(f"DEBUG: Found {len(future_prices)} future prices.")
+                if future_prices:
+                    st.write("Sample Future Prices:", list(future_prices.items())[:5])
 
             # Prepare Option Keys to Fetch
             option_keys_to_fetch = []
@@ -739,6 +800,10 @@ if should_run:
                 
                 if ce_key: option_keys_to_fetch.append(ce_key)
                 if pe_key: option_keys_to_fetch.append(pe_key)
+            
+            if debug_mode:
+                st.write(f"DEBUG: Symbol ATM Map size: {len(symbol_atm_map)}")
+                st.write(f"DEBUG: Options keys to fetch: {len(option_keys_to_fetch)}")
                 
             # Batch Fetch Options Data
             options_data_map = {}

@@ -14,3 +14,7 @@ instruments_cache.pkl
 venv/
 env/
 .env
+
+# Large Files
+api-scrip-master.csv
+!api-scrip-master.csv.gz
